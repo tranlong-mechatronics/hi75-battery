@@ -1,0 +1,5 @@
+/target
+/dist
+*.zip
+debug.log
+preview_*.png
