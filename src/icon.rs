@@ -163,25 +163,42 @@ pub fn create_battery_icon(battery_opt: Option<u8>, is_charging: bool, size: u32
     raw
 }
 
-/// Renders the horizontal taskbar widget `[Battery] 49%` as premultiplied BGRA8 bytes
+/// Renders the horizontal taskbar widget `[Kuromi] [Battery] 49%` as premultiplied BGRA8 bytes
 /// suitable for Win32 `UpdateLayeredWindow`. Returns `(width_px, height_px, bgra_bytes)`.
 pub fn create_taskbar_widget_bgra(
     battery_opt: Option<u8>,
     is_charging: bool,
     hovered: bool,
     scale: f32,
+    show_kuromi: bool,
+    kuromi_mood: crate::kuromi::KuromiMood,
+    kuromi_frame: usize,
 ) -> (u32, u32, Vec<u8>) {
     let scale = scale.clamp(1.0, 3.0);
     let height_dip = WIDGET_LOGICAL_HEIGHT;
     let pad_x = 7.0f32;
+    let kuromi_dip = 28.0f32;
+    let kuromi_left_dip = 3.0f32;
+    let kuromi_gap_dip = 3.5f32;
 
     let light_mode = is_light_theme();
     let is_active = battery_opt.is_some() || is_charging;
-    let fg_color = match (light_mode, is_active) {
-        (true, true) => "#191919",
+    let text_color = match (light_mode, is_active) {
+        (true, true) => "#111827",
         (true, false) => "#64748B",
         (false, true) => "#F8FAFC",
         (false, false) => "#94A3B8",
+    };
+
+    // Outer battery shell color (rich dark charcoal in light mode, crisp white in dark mode,
+    // or soft red when disconnected like the bottom-right icon in the reference image)
+    let is_disconnected = battery_opt.is_none() && !is_charging;
+    let shell_color = if is_disconnected {
+        "#E11D48"
+    } else if light_mode {
+        "#0F172A"
+    } else {
+        "#F8FAFC"
     };
 
     // Tiny alpha (0.004) when unhovered ensures Windows hit-testing catches mouse events
@@ -196,33 +213,44 @@ pub fn create_taskbar_widget_bgra(
         ("rgba(0, 0, 0, 0.004)", "none")
     };
 
-    let fill_color = battery_fill_color(battery_opt, is_charging);
-
-    // Coordinates relative to battery left edge = 0.0, vertically centered in 32 DIP height
-    let inner_bar = match battery_opt {
-        Some(pct_val) => {
-            let w = (13.8 * (pct_val as f32 / 100.0)).clamp(2.0, 13.8);
-            format!(
-                r##"<rect x="1.6" y="12.4" width="{:.2}" height="7.2" rx="1.1" fill="{}" />"##,
-                w, fill_color
-            )
-        }
-        None if is_charging => format!(
-            r##"<rect x="1.6" y="12.4" width="13.8" height="7.2" rx="1.1" fill="{}" />"##,
-            fill_color
-        ),
-        None => String::new(),
+    // Gradient stops matching the reference image (smooth green -> lime, or warm red-orange -> amber)
+    let (grad_start, grad_end) = match battery_opt {
+        Some(b) if b > 45 => ("#22C55E", "#84CC16"),
+        Some(b) if b > 20 => ("#EA580C", "#FB923C"),
+        Some(_) => ("#DC2626", "#F97316"),
+        None => ("#94A3B8", "#CBD5E1"),
     };
 
-    let bolt_overlay = if is_charging {
-        let bolt_stroke = if light_mode { "#191919" } else { "#0F172A" };
-        let bolt_fill = "#FACC15";
+    // Battery body: x=0.0..20.5, y=9.6..22.4 (height 12.8, rx=3.8 for super smooth squircle curve)
+    // Inner bar: x=2.3, y=11.9, max_width=15.9, height=8.2, rx=2.2 (hidden when charging so the slanted bolt stands out cleanly like Image_2)
+    let inner_bar = if is_charging {
+        String::new()
+    } else if let Some(pct_val) = battery_opt {
+        let w = (15.9 * (pct_val as f32 / 100.0)).clamp(3.2, 15.9);
+        format!(
+            r##"<rect x="2.3" y="11.9" width="{:.2}" height="8.2" rx="2.2" fill="url(#batGrad)" />"##,
+            w
+        )
+    } else {
+        String::new()
+    };
+
+    let overlay_graphic = if is_charging {
+        // Slanted, smooth-cornered yellow lightning bolt inside the battery matching Image_2
+        r##"
+        <path d="M12.4 11.6 L6.4 15.7 L9.9 16.4 L8.0 20.4 L14.1 16.3 L10.6 15.6 Z"
+              fill="url(#boltGrad)" stroke="url(#boltGrad)" stroke-width="0.95"
+              stroke-linejoin="round" stroke-linecap="round" />
+        "##
+        .to_string()
+    } else if is_disconnected {
+        // Diagonal red slash across the battery matching the bottom-right reference icon
         format!(
             r##"
-            <path d="M9.7 9.8 L6.4 15.8 H9.2 L8.2 22.0 L12.4 15.1 H9.6 L10.6 9.8 Z"
-                  fill="{}" stroke="{}" stroke-width="0.8" stroke-linejoin="round" />
+            <line x1="3.8" y1="23.6" x2="17.2" y2="8.4"
+                  stroke="{}" stroke-width="2.1" stroke-linecap="round" />
             "##,
-            bolt_fill, bolt_stroke
+            shell_color
         )
     } else {
         String::new()
@@ -236,20 +264,39 @@ pub fn create_taskbar_widget_bgra(
 
     let content_group = format!(
         r##"
+        <defs>
+            <linearGradient id="batGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="{}" />
+                <stop offset="100%" stop-color="{}" />
+            </linearGradient>
+            <linearGradient id="boltGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#FDE047" />
+                <stop offset="100%" stop-color="#F59E0B" />
+            </linearGradient>
+        </defs>
         <g id="content">
-            <rect x="0.0" y="10.8" width="17.0" height="10.4" rx="2.1"
-                  fill="none" stroke="{}" stroke-width="1.15" stroke-linejoin="round" />
-            <path d="M18.2 14.3 V17.7"
-                  stroke="{}" stroke-width="1.35" stroke-linecap="round" />
+            <!-- Smooth rounded battery body with transparent interior -->
+            <rect x="0.0" y="9.6" width="20.5" height="12.8" rx="3.8"
+                  fill="none" stroke="{}" stroke-width="1.75" stroke-linejoin="round" />
+            <!-- Solid rounded positive terminal bump attached to right wall -->
+            <path d="M20.5 12.7 H21.7 A1.3 1.3 0 0 1 23.0 14.0 V18.0 A1.3 1.3 0 0 1 21.7 19.3 H20.5 Z"
+                  fill="{}" />
             {}
             {}
-            <text x="22.0" y="19.7"
+            <text x="26.2" y="19.8"
                   font-family="Segoe UI Variable Text, Segoe UI, sans-serif"
-                  font-size="11.0" font-weight="500"
+                  font-size="11.2" font-weight="600"
                   fill="{}">{}</text>
         </g>
         "##,
-        fg_color, fg_color, inner_bar, bolt_overlay, fg_color, label
+        grad_start,
+        grad_end,
+        shell_color,
+        shell_color,
+        inner_bar,
+        overlay_graphic,
+        text_color,
+        label
     );
 
     let fontdb = get_font_db();
@@ -259,7 +306,7 @@ pub fn create_taskbar_widget_bgra(
 
     // First pass: measure exact rendered bounding box of the battery + label group
     let measure_svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="32" viewBox="0 0 120 32">{}</svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="140" height="32" viewBox="0 0 140 32">{}</svg>"##,
         content_group
     );
     let measure_tree = Tree::from_str(&measure_svg, &opt).unwrap();
@@ -267,14 +314,19 @@ pub fn create_taskbar_widget_bgra(
         .node_by_id("content")
         .map(|n| {
             let b = n.abs_bounding_box();
-            (b.left(), (b.right() - b.left()).max(20.0))
+            (b.left(), (b.right() - b.left()).max(24.0))
         })
-        .unwrap_or((0.0, 44.0));
+        .unwrap_or((0.0, 48.0));
 
-    let width_dip = content_width + pad_x * 2.0;
+    let left_offset_dip = if show_kuromi {
+        kuromi_left_dip + kuromi_dip + kuromi_gap_dip
+    } else {
+        pad_x
+    };
+    let width_dip = left_offset_dip + content_width + pad_x;
     let width_px = (width_dip * scale).round() as u32;
     let height_px = (height_dip * scale).round() as u32;
-    let x_shift = pad_x - content_left;
+    let x_shift = left_offset_dip - content_left;
 
     let final_svg = format!(
         r##"
@@ -310,5 +362,22 @@ pub fn create_taskbar_widget_bgra(
         bgra.push(pixel.red());
         bgra.push(pixel.alpha());
     }
+
+    if show_kuromi {
+        let sprite_px = (kuromi_dip * scale).round() as u32;
+        let dst_x = (kuromi_left_dip * scale).round() as i32;
+        let dst_y = ((height_px as i32 - sprite_px as i32) / 2).max(0);
+        crate::kuromi::blit_kuromi_bgra(
+            &mut bgra,
+            width_px,
+            height_px,
+            dst_x,
+            dst_y,
+            sprite_px,
+            kuromi_mood,
+            kuromi_frame,
+        );
+    }
+
     (width_px, height_px, bgra)
 }

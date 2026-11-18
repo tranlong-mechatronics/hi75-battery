@@ -34,11 +34,14 @@ use winapi::um::winuser::{
 pub const WM_WIDGET_REFRESH: u32 = WM_APP + 20;
 pub const WM_WIDGET_TOGGLE_AUTOSTART: u32 = WM_APP + 21;
 pub const WM_WIDGET_QUIT: u32 = WM_APP + 22;
+pub const WM_WIDGET_CHECK_UPDATE: u32 = WM_APP + 23;
 
 const TIMER_SYNC_ID: usize = 1;
 const CMD_REFRESH: usize = 1001;
 const CMD_AUTOSTART: usize = 1002;
 const CMD_QUIT: usize = 1003;
+const CMD_TOGGLE_KUROMI: usize = 1004;
+const CMD_CHECK_UPDATE: usize = 1005;
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -60,6 +63,10 @@ struct WidgetState {
     pos_y: i32,
     last_light_theme: bool,
     tooltip_text: String,
+    show_kuromi: bool,
+    anim_frame: usize,
+    anim_tick: u32,
+    love_ticks_left: u8,
 }
 
 pub struct TaskbarWidget {
@@ -97,7 +104,7 @@ impl TaskbarWidget {
             RegisterClassExW(&wc);
 
             let initial_scale = detect_taskbar_scale();
-            let initial_w = (56.0 * initial_scale).round() as i32;
+            let initial_w = (84.0 * initial_scale).round() as i32;
             let initial_h = (WIDGET_LOGICAL_HEIGHT * initial_scale).round() as i32;
             let tooltip_text = "Leobog Hi75C Pro: Đang kết nối...".to_string();
 
@@ -117,6 +124,10 @@ impl TaskbarWidget {
                 pos_y: 0,
                 last_light_theme: is_light_theme(),
                 tooltip_text,
+                show_kuromi: true,
+                anim_frame: 0,
+                anim_tick: 0,
+                love_ticks_left: 0,
             });
             let state_ptr = Box::into_raw(state);
 
@@ -186,7 +197,7 @@ impl TaskbarWidget {
 
             render_widget(&mut *state_ptr);
             sync_position_and_visibility(&mut *state_ptr, true);
-            SetTimer(hwnd, TIMER_SYNC_ID, 100, None);
+            SetTimer(hwnd, TIMER_SYNC_ID, 50, None);
 
             Some(Self { hwnd, state_ptr })
         }
@@ -294,8 +305,21 @@ unsafe fn update_tooltip_rect(state: &WidgetState) {
 }
 
 unsafe fn render_widget(state: &mut WidgetState) {
-    let (w, h, bgra) =
-        create_taskbar_widget_bgra(state.battery, state.charging, state.hovered, state.scale);
+    let mood = crate::kuromi::pick_mood(
+        state.battery,
+        state.charging,
+        state.hovered,
+        state.love_ticks_left,
+    );
+    let (w, h, bgra) = create_taskbar_widget_bgra(
+        state.battery,
+        state.charging,
+        state.hovered,
+        state.scale,
+        state.show_kuromi,
+        mood,
+        state.anim_frame,
+    );
     state.width_px = w as i32;
     state.height_px = h as i32;
 
@@ -350,9 +374,84 @@ unsafe fn render_widget(state: &mut WidgetState) {
     }
 }
 
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmGetWindowAttribute(
+        hwnd: HWND,
+        dw_attribute: DWORD,
+        pv_attribute: *mut c_void,
+        cb_attribute: DWORD,
+    ) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(dw_desired_access: DWORD, b_inherit_handle: i32, dw_process_id: DWORD) -> *mut c_void;
+    fn CloseHandle(h_object: *mut c_void) -> i32;
+    fn QueryFullProcessImageNameW(
+        h_process: *mut c_void,
+        dw_flags: DWORD,
+        lp_exe_name: *mut u16,
+        lpdw_size: *mut DWORD,
+    ) -> i32;
+}
+
+unsafe fn get_window_exe_lowercase(hwnd: HWND) -> String {
+    let mut pid: DWORD = 0;
+    unsafe {
+        winapi::um::winuser::GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == 0 {
+        return String::new();
+    }
+    // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    let h_proc = unsafe { OpenProcess(0x1000, 0, pid) };
+    if h_proc.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u16; 260];
+    let mut sz: DWORD = buf.len() as DWORD;
+    let ok = unsafe { QueryFullProcessImageNameW(h_proc, 0, buf.as_mut_ptr(), &mut sz) };
+    unsafe {
+        CloseHandle(h_proc);
+    }
+    if ok == 0 || sz == 0 {
+        return String::new();
+    }
+    let full = String::from_utf16_lossy(&buf[..sz as usize]).to_lowercase();
+    full.rsplit('\\').next().unwrap_or(&full).to_string()
+}
+
+unsafe fn is_window_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    // DWMWA_CLOAKED = 14
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            14,
+            &mut cloaked as *mut u32 as *mut c_void,
+            size_of::<u32>() as DWORD,
+        )
+    };
+    hr == 0 && cloaked != 0
+}
+
+unsafe fn is_snipping_exe(exe: &str) -> bool {
+    matches!(
+        exe,
+        "screenclippinghost.exe"
+            | "snippingtool.exe"
+            | "screensketch.exe"
+            | "lightshot.exe"
+            | "sharex.exe"
+            | "flameshot.exe"
+            | "greenshot.exe"
+    )
+}
+
 unsafe fn is_shell_window_covering_us(widget: HWND, shell_tray: HWND) -> bool {
     let mut cur = unsafe { GetWindow(widget, GW_HWNDPREV) };
-    for _ in 0..64 {
+    for _ in 0..2048 {
         if cur.is_null() {
             break;
         }
@@ -364,65 +463,133 @@ unsafe fn is_shell_window_covering_us(widget: HWND, shell_tray: HWND) -> bool {
     false
 }
 
-unsafe fn is_fullscreen_on_tray_monitor(shell_tray: HWND, tray_rc: &RECT) -> bool {
-    let fg = unsafe { GetForegroundWindow() };
-    if fg.is_null() || fg == shell_tray {
-        return false;
-    }
-
-    let mut cls_buf = [0u16; 128];
-    let len = unsafe { GetClassNameW(fg, cls_buf.as_mut_ptr(), cls_buf.len() as i32) };
-    let cls = String::from_utf16_lossy(&cls_buf[..len.max(0) as usize]);
-    if matches!(
-        cls.as_str(),
-        "Progman"
-            | "WorkerW"
-            | "Shell_TrayWnd"
-            | "NotifyIconOverflowWindow"
-            | "TopLevelWindowForOverflowXamlIsland"
-            | "Xaml_WindowedPopupClass"
-    ) {
-        return false;
-    }
-
+unsafe fn is_fullscreen_or_snipping(
+    widget_hwnd: HWND,
+    tooltip_hwnd: HWND,
+    shell_tray: HWND,
+    tray_rc: &RECT,
+) -> bool {
     let tray_mon = unsafe { MonitorFromWindow(shell_tray, MONITOR_DEFAULTTONEAREST) };
-    let fg_mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
-    if tray_mon != fg_mon {
-        return false;
-    }
-
     let mut mi: MONITORINFO = unsafe { zeroed() };
     mi.cbSize = size_of::<MONITORINFO>() as DWORD;
     if unsafe { GetMonitorInfoW(tray_mon, &mut mi) } == 0 {
         return false;
     }
 
-    let mut fg_rc: RECT = unsafe { zeroed() };
-    if unsafe { GetWindowRect(fg, &mut fg_rc) } == 0 {
-        return false;
+    // 1. Direct check on Foreground Window (catches fullscreen apps even if owner Z-order kept Shell_TrayWnd above them,
+    // and catches Snipping Tool when it has focus).
+    let fg = unsafe { GetForegroundWindow() };
+    if !fg.is_null() && fg != shell_tray && fg != widget_hwnd && fg != tooltip_hwnd {
+        let fg_exe = unsafe { get_window_exe_lowercase(fg) };
+        if unsafe { is_snipping_exe(&fg_exe) } {
+            return true;
+        }
+
+        let mut cls_buf = [0u16; 128];
+        let len = unsafe { GetClassNameW(fg, cls_buf.as_mut_ptr(), cls_buf.len() as i32) };
+        let cls = String::from_utf16_lossy(&cls_buf[..len.max(0) as usize]);
+        if !matches!(
+            cls.as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        ) && !matches!(
+            fg_exe.as_str(),
+            "textinputhost.exe"
+                | "searchhost.exe"
+                | "startmenuexperiencehost.exe"
+                | "shellexperiencehost.exe"
+        ) {
+            let fg_mon = unsafe { MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) };
+            if fg_mon == tray_mon {
+                let mut fg_rc: RECT = unsafe { zeroed() };
+                if unsafe { GetWindowRect(fg, &mut fg_rc) } != 0 {
+                    // Normal maximized windows stop near tray_rc.top (mi.rcWork.bottom + ~8px).
+                    // Only true fullscreen windows cover the entire monitor all the way to mi.rcMonitor.bottom.
+                    if fg_rc.left <= mi.rcMonitor.left + 2
+                        && fg_rc.top <= mi.rcMonitor.top + 2
+                        && fg_rc.right >= mi.rcMonitor.right - 2
+                        && fg_rc.bottom >= mi.rcMonitor.bottom - 2
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
-    // Maximized windows have an invisible resize border (~8px) that extends outside rcWork,
-    // so their bottom stays near tray_rc.top. A true fullscreen window covers the entire monitor
-    // AND extends all the way to the bottom of the taskbar (and sits above Shell_TrayWnd in Z-order).
-    let covers_monitor = fg_rc.left <= mi.rcMonitor.left
-        && fg_rc.top <= mi.rcMonitor.top
-        && fg_rc.right >= mi.rcMonitor.right
-        && fg_rc.bottom >= tray_rc.bottom;
-
-    if !covers_monitor {
-        return false;
-    }
-
-    // Verify fg is actually above Shell_TrayWnd in Z-order (true fullscreen), not behind it
+    // 2. Walk ALL windows above Shell_TrayWnd in Z-order (up to 4096 windows)
+    // Catches Snipping Tool overlays (which often use WS_EX_NOACTIVATE so they don't become GetForegroundWindow)
+    // as well as fullscreen windows when a small popup/notification temporarily has focus.
     let mut cur = unsafe { GetWindow(shell_tray, GW_HWNDPREV) };
-    for _ in 0..64 {
+    for _ in 0..4096 {
         if cur.is_null() {
             break;
         }
-        if cur == fg {
+        if cur == widget_hwnd || cur == tooltip_hwnd {
+            cur = unsafe { GetWindow(cur, GW_HWNDPREV) };
+            continue;
+        }
+        if unsafe { IsWindowVisible(cur) } == 0 || unsafe { is_window_cloaked(cur) } {
+            cur = unsafe { GetWindow(cur, GW_HWNDPREV) };
+            continue;
+        }
+
+        let mut cls_buf = [0u16; 128];
+        let len = unsafe { GetClassNameW(cur, cls_buf.as_mut_ptr(), cls_buf.len() as i32) };
+        let cls = String::from_utf16_lossy(&cls_buf[..len.max(0) as usize]);
+
+        if cls.contains("ScreenClipping") || cls.contains("Snipping") {
             return true;
         }
+
+        if matches!(
+            cls.as_str(),
+            "Progman"
+                | "WorkerW"
+                | "Shell_TrayWnd"
+                | "Shell_SecondaryTrayWnd"
+                | "tooltips_class32"
+        ) {
+            cur = unsafe { GetWindow(cur, GW_HWNDPREV) };
+            continue;
+        }
+
+        // Check if this visible, uncloaked topmost window belongs to Snipping Tool (even if it's just the small top bar!)
+        let exe = unsafe { get_window_exe_lowercase(cur) };
+        if unsafe { is_snipping_exe(&exe) } {
+            return true;
+        }
+
+        let ex_style = unsafe { GetWindowLongPtrW(cur, winapi::um::winuser::GWL_EXSTYLE) } as u32;
+        let is_clickthrough = (ex_style & 0x00000020) != 0;
+
+        let mut rc: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(cur, &mut rc) } != 0
+            && rc.right > rc.left
+            && rc.bottom > rc.top
+        {
+            let cur_mon = unsafe { MonitorFromWindow(cur, MONITOR_DEFAULTTONEAREST) };
+            if cur_mon == tray_mon {
+                let covers_monitor = rc.left <= mi.rcMonitor.left + 2
+                    && rc.top <= mi.rcMonitor.top + 2
+                    && rc.right >= mi.rcMonitor.right - 2
+                    && rc.bottom >= tray_rc.bottom - 2;
+
+                if covers_monitor
+                    && !is_clickthrough
+                    && !matches!(
+                        exe.as_str(),
+                        "textinputhost.exe"
+                            | "searchhost.exe"
+                            | "startmenuexperiencehost.exe"
+                            | "shellexperiencehost.exe"
+                            | "lockapp.exe"
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+
         cur = unsafe { GetWindow(cur, GW_HWNDPREV) };
     }
     false
@@ -456,7 +623,7 @@ unsafe fn sync_position_and_visibility(state: &mut WidgetState, force: bool) {
         GetWindowRect(tray_notify, &mut notify_rc);
     }
 
-    // Check if taskbar is auto-hidden off-screen or a fullscreen app is active
+    // Check if taskbar is auto-hidden off-screen or a fullscreen/snipping app is active
     let tray_mon = unsafe { MonitorFromWindow(shell_tray, MONITOR_DEFAULTTONEAREST) };
     let mut mi: MONITORINFO = unsafe { zeroed() };
     mi.cbSize = size_of::<MONITORINFO>() as DWORD;
@@ -464,7 +631,7 @@ unsafe fn sync_position_and_visibility(state: &mut WidgetState, force: bool) {
     let auto_hidden = monitor_ok && tray_rc.top >= mi.rcMonitor.bottom - 4;
 
     if auto_hidden
-        || unsafe { is_fullscreen_on_tray_monitor(shell_tray, &tray_rc) }
+        || unsafe { is_fullscreen_or_snipping(state.hwnd, state.tooltip_hwnd, shell_tray, &tray_rc) }
         || notify_rc.left <= 0
     {
         if state.visible {
@@ -523,7 +690,7 @@ unsafe fn sync_position_and_visibility(state: &mut WidgetState, force: bool) {
     }
 }
 
-unsafe fn show_context_menu(state: &WidgetState) {
+unsafe fn show_context_menu(state: &mut WidgetState) {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
@@ -531,16 +698,28 @@ unsafe fn show_context_menu(state: &WidgetState) {
         }
 
         let refresh_txt = to_wide("Làm mới (Refresh)");
+        let kuromi_txt = to_wide("Hiện Kuromi trên Taskbar");
         let autostart_txt = to_wide("Khởi động cùng Windows");
+        let update_txt = to_wide(&format!(
+            "Kiểm tra cập nhật (v{})",
+            crate::updater::APP_VERSION
+        ));
         let quit_txt = to_wide("Thoát (Exit)");
 
         AppendMenuW(menu, MF_STRING, CMD_REFRESH, refresh_txt.as_ptr());
+        let kuromi_flags = if state.show_kuromi {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING | MF_UNCHECKED
+        };
+        AppendMenuW(menu, kuromi_flags, CMD_TOGGLE_KUROMI, kuromi_txt.as_ptr());
         let auto_flags = if state.autostart_enabled.load(Ordering::SeqCst) {
             MF_STRING | MF_CHECKED
         } else {
             MF_STRING | MF_UNCHECKED
         };
         AppendMenuW(menu, auto_flags, CMD_AUTOSTART, autostart_txt.as_ptr());
+        AppendMenuW(menu, MF_STRING, CMD_CHECK_UPDATE, update_txt.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
         AppendMenuW(menu, MF_STRING, CMD_QUIT, quit_txt.as_ptr());
 
@@ -574,8 +753,20 @@ unsafe fn show_context_menu(state: &WidgetState) {
             CMD_REFRESH => {
                 PostThreadMessageW(state.main_thread_id, WM_WIDGET_REFRESH, 0, 0);
             }
+            CMD_TOGGLE_KUROMI => {
+                state.show_kuromi = !state.show_kuromi;
+                let old_w = state.width_px;
+                render_widget(state);
+                if state.width_px != old_w {
+                    update_tooltip_rect(state);
+                }
+                sync_position_and_visibility(state, true);
+            }
             CMD_AUTOSTART => {
                 PostThreadMessageW(state.main_thread_id, WM_WIDGET_TOGGLE_AUTOSTART, 0, 0);
+            }
+            CMD_CHECK_UPDATE => {
+                PostThreadMessageW(state.main_thread_id, WM_WIDGET_CHECK_UPDATE, 0, 0);
             }
             CMD_QUIT => {
                 PostThreadMessageW(state.main_thread_id, WM_WIDGET_QUIT, 0, 0);
@@ -608,6 +799,18 @@ unsafe extern "system" fn widget_wnd_proc(
             WM_TIMER => {
                 if wparam == TIMER_SYNC_ID {
                     sync_position_and_visibility(state, false);
+                    state.anim_tick = state.anim_tick.wrapping_add(1);
+                    if state.anim_tick % 4 == 0 {
+                        state.anim_frame = (state.anim_frame + 1) % 4;
+                        state.love_ticks_left = state.love_ticks_left.saturating_sub(1);
+                        if state.show_kuromi && state.visible {
+                            let old_w = state.width_px;
+                            render_widget(state);
+                            if state.width_px != old_w {
+                                update_tooltip_rect(state);
+                            }
+                        }
+                    }
                 }
                 0
             }
@@ -633,6 +836,8 @@ unsafe extern "system" fn widget_wnd_proc(
                 0
             }
             WM_LBUTTONUP => {
+                state.love_ticks_left = 14;
+                render_widget(state);
                 PostThreadMessageW(state.main_thread_id, WM_WIDGET_REFRESH, 0, 0);
                 0
             }

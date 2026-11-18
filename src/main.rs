@@ -2,6 +2,8 @@
 
 mod hid;
 mod icon;
+mod kuromi;
+mod updater;
 mod widget;
 
 use auto_launch::AutoLaunch;
@@ -19,7 +21,10 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
 };
-use widget::{TaskbarWidget, WM_WIDGET_QUIT, WM_WIDGET_REFRESH, WM_WIDGET_TOGGLE_AUTOSTART};
+use widget::{
+    TaskbarWidget, WM_WIDGET_CHECK_UPDATE, WM_WIDGET_QUIT, WM_WIDGET_REFRESH,
+    WM_WIDGET_TOGGLE_AUTOSTART,
+};
 use winapi::um::winuser::{
     DispatchMessageW, GetMessageW, GetSystemMetrics, OpenDesktopW, PostQuitMessage,
     PostThreadMessageW, SetProcessDpiAwarenessContext, SetThreadDesktop, TranslateMessage, MSG,
@@ -63,10 +68,13 @@ fn log(msg: &str) {
 
 fn format_tooltip(battery_opt: Option<u8>, is_charging: bool) -> String {
     match (battery_opt, is_charging) {
-        (Some(pct), true) => format!("Leobog Hi75C Pro: {}% (Đang sạc)", pct),
-        (Some(pct), false) => format!("Leobog Hi75C Pro: {}% (Đang dùng pin)", pct),
-        (None, true) => "Leobog Hi75C Pro: Đang sạc qua dây USB".to_string(),
-        (None, false) => "Leobog Hi75C Pro: Đang ngủ / Chưa kết nối".to_string(),
+        (Some(pct), true) => format!("Leobog Hi75C Pro: {}% (Đang sạc ⚡ — Kuromi vui vẻ!)", pct),
+        (Some(pct), false) if pct <= 20 => {
+            format!("Leobog Hi75C Pro: {}% (Pin yếu rùi, cắm sạc cho Kuromi nhé! 🥺)", pct)
+        }
+        (Some(pct), false) => format!("Leobog Hi75C Pro: {}% (Đang dùng pin — Kuromi đang canh pin 💜)", pct),
+        (None, true) => "Leobog Hi75C Pro: Đang sạc qua dây USB ⚡".to_string(),
+        (None, false) => "Leobog Hi75C Pro: Đang ngủ Zzz / Chưa kết nối".to_string(),
     }
 }
 
@@ -134,17 +142,32 @@ fn main() {
         return;
     }
 
+    let is_updated_restart = env::args().any(|a| a == "--updated");
+    if is_updated_restart {
+        thread::sleep(Duration::from_millis(800));
+    }
+
     // Đảm bảo chỉ chạy duy nhất 1 tiến trình (tránh mở trùng khi click nhiều lần)
     unsafe {
         let mutex_name: Vec<u16> = "Local\\LeobogHi75CBatteryMonitorMutex\0"
             .encode_utf16()
             .collect();
-        let h_mutex = CreateMutexW(null_mut(), 1, mutex_name.as_ptr());
-        if !h_mutex.is_null() && winapi::um::errhandlingapi::GetLastError() == 183 {
-            // ERROR_ALREADY_EXISTS = 183
+        let mut acquired = false;
+        let attempts = if is_updated_restart { 10 } else { 1 };
+        for _ in 0..attempts {
+            let h_mutex = CreateMutexW(null_mut(), 1, mutex_name.as_ptr());
+            if !h_mutex.is_null() && winapi::um::errhandlingapi::GetLastError() != 183 {
+                acquired = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+        if !acquired {
             return;
         }
     }
+
+    updater::cleanup_old_binary();
 
     log("hi75-battery starting...");
 
@@ -324,6 +347,21 @@ fn main() {
         }
     };
 
+    // 5. Background Auto-Updater: kiểm tra bản mới trên GitHub khi khởi động (sau 5s) và định kỳ mỗi 4 tiếng
+    let is_running_updater = Arc::clone(&is_running);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        while is_running_updater.load(Ordering::SeqCst) {
+            if updater::check_and_apply_update(false) {
+                unsafe {
+                    PostThreadMessageW(main_thread_id, WM_WIDGET_QUIT, 0, 0);
+                }
+                return;
+            }
+            thread::sleep(Duration::from_secs(4 * 3600));
+        }
+    });
+
     log("Entering GetMessageW loop...");
     unsafe {
         let mut msg: MSG = zeroed();
@@ -336,6 +374,13 @@ fn main() {
                     }
                     WM_WIDGET_TOGGLE_AUTOSTART => {
                         toggle_autostart();
+                    }
+                    WM_WIDGET_CHECK_UPDATE => {
+                        thread::spawn(move || {
+                            if updater::check_and_apply_update(true) {
+                                PostThreadMessageW(main_thread_id, WM_WIDGET_QUIT, 0, 0);
+                            }
+                        });
                     }
                     WM_WIDGET_QUIT => {
                         log("User clicked Quit from widget, posting WM_QUIT");
