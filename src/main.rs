@@ -117,7 +117,24 @@ fn ensure_installed_and_autostart() -> bool {
 
     if explicit_install || (!is_dev_target && !already_in_install_dir) {
         let _ = std::fs::create_dir_all(&install_dir);
+
+        // Tự động tắt bản cũ đang chạy (nếu có) và đổi tên file cũ sang .old để luôn ghi đè thành công 100%
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = std::process::Command::new("taskkill.exe")
+            .args(["/F", "/IM", "Leobog-Hi75C-Pro-Battery.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        std::thread::sleep(Duration::from_millis(250));
+
+        let old_backup = installed_exe.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old_backup);
+        if installed_exe.exists() {
+            let _ = std::fs::rename(&installed_exe, &old_backup);
+        }
+
         if std::fs::copy(&current_exe, &installed_exe).is_ok() {
+            let _ = std::fs::remove_file(&old_backup);
             if let Some(path_str) = installed_exe.to_str() {
                 let auto = AutoLaunch::new(
                     "Hi75BatteryMonitor",
@@ -128,7 +145,7 @@ fn ensure_installed_and_autostart() -> bool {
                 let _ = auto.enable();
             }
             let _ = std::process::Command::new(&installed_exe)
-                .arg("--autostart")
+                .arg("--updated")
                 .spawn();
             return true;
         }
